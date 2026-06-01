@@ -1,6 +1,8 @@
 import logging
 import sqlite3
 import os
+import asyncio
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,11 +20,25 @@ DB_PATH = "novels.db"
 JOB_ID = "daily_novel_post"
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Africa/Cairo"))
 
+# --- ويب سيرفر وهمي لإرضاء Railway ومنع الكراش ---
+async def handle_health_check(request):
+    return web.Response(text="Bot is alive and running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Railway بيبعت رقم البوت في متغير اسمه PORT تلقائياً
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Web Server started on port {port}")
+
 # --- إعداد قاعدة البيانات وتخزين الوقت ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # جدول الفصول
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chapters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,14 +46,12 @@ def init_db():
             is_posted INTEGER DEFAULT 0
         )
     ''')
-    # جدول الإعدادات لحفظ الساعة والدقيقة
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     ''')
-    # وضع قيم افتراضية للوقت لو مش موجودة (الساعة 6 مساءً مثلاً)
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('hour', '18')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('minute', '0')")
     conn.commit()
@@ -93,7 +107,6 @@ async def auto_publish(context: ContextTypes.DEFAULT_TYPE):
 def scheduled_task(app):
     app.loop.create_task(auto_publish(ContextTypes.DEFAULT_TYPE(application=app)))
 
-# تحديث وقت الجدولة ديناميكياً
 def reschedule_job(app, hour, minute):
     if scheduler.get_job(JOB_ID):
         scheduler.remove_job(JOB_ID)
@@ -141,21 +154,19 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         h = get_setting('hour', 18)
         m = get_setting('minute', 0)
         context.user_data['action'] = 'waiting_for_time'
-        await query.edit_message_text(f"⏰ وقت النشر الحالي هو **{h:02d}:{m:02d}**.\n\nلتغييره، أرسل الوقت الجديد بصيغة (ساعة:دقيقة) بنظام 24 ساعة.\nمثال: `21:30` ليكون الساعة 9:30 مساءً، أو `15:00` ليكون الساعة 3 عصراً.")
+        await query.edit_message_text(f"⏰ وقت النشر الحالي هو **{h:02d}:{m:02d}**.\n\nلتغييره، أرسل الوقت الجديد بصيغة (ساعة:دقيقة) بنظام 24 ساعة.\nمثال: `21:30` ليكون الساعة 9:30 مساءً.")
 
     elif query.data == 'publish_now':
         await query.edit_message_text("🔄 جاري النشر الفوري...")
         await auto_publish(context)
         await context.bot.send_message(chat_id=ADMIN_ID, text="قائمة التحكم:", reply_markup=admin_keyboard())
 
-# --- معالجة الرسائل النصية المكتوبة من الأدمن ---
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
     action = context.user_data.get('action')
 
-    # 1. حالة استقبال فصل جديد
     if action == 'waiting_for_chapter':
         chapter_text = update.message.text
         conn = sqlite3.connect(DB_PATH)
@@ -163,11 +174,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute('INSERT INTO chapters (content) VALUES (?)', (chapter_text,))
         conn.commit()
         conn.close()
-        
         context.user_data['action'] = None
         await update.message.reply_text("✅ تم حفظ الفصل بنجاح وضمه للطابور!", reply_markup=admin_keyboard())
 
-    # 2. حالة استقبال الوقت الجديد
     elif action == 'waiting_for_time':
         time_text = update.message.text.strip()
         try:
@@ -178,13 +187,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 update_setting('hour', hour)
                 update_setting('minute', minute)
-                
                 reschedule_job(context.application, hour, minute)
-                
                 context.user_data['action'] = None
                 await update.message.reply_text(f"✅ تم تحديث وقت النشر التلقائي بنجاح إلى **{hour:02d}:{minute:02d}** يومياً!", reply_markup=admin_keyboard())
             else:
-                await update.message.reply_text("❌ أرقام غير صحيحة! الساعة يجب أن تكون بين 0 و 23، والدقائق بين 0 و 59. جرب تاني:")
+                await update.message.reply_text("❌ أرقام غير صحيحة! الساعة بين 0-23 والدقائق بين 0-59.")
         except:
             await update.message.reply_text("❌ صيغة الوقت غير صحيحة. يرجى إرسالها بالشكل التالي `ساعة:دقيقة` مثل `18:30`:")
 
@@ -206,7 +213,11 @@ def main():
     reschedule_job(app, h, m)
     scheduler.start()
 
-    print("🚀 البوت يعمل الآن ولوحة التحكم بالوقت جاهزة...")
+    # تشغيل الويب سيرفر في نفس الوقت مع البوت لمنع الكراش
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
+
+    print("🚀 البوت يعمل الآن مع السيرفر الوهمي للحماية من الكراش...")
     app.run_polling()
 
 if __name__ == '__main__':
